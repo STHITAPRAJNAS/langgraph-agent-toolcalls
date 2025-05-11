@@ -21,6 +21,10 @@ from app.core.types import (
     SQLGenerationOutput,
     UserHint,
     ValidationOutput,
+    QueryStatus,
+    QueryAttempt,
+    QueryHistory,
+    KnowledgeResult
 )
 from app.services.bedrock import get_bedrock_llm
 from app.services.checkpoint import get_checkpoint_manager, get_tool_executor
@@ -28,6 +32,9 @@ from app.services.vector_store import (
     get_confluence_retriever,
     get_databricks_retriever,
     get_graphql_schema_retriever,
+    search_confluence,
+    search_graphql_schema,
+    search_databricks
 )
 
 
@@ -95,38 +102,41 @@ class ChatbotAgent:
         self.graph = self._build_graph()
 
     def _build_graph(self) -> StateGraph:
-        """Build the agent graph."""
-        # Create graph
-        graph = StateGraph(AgentState)
+        """Build the agent graph with autonomous execution capabilities."""
+        workflow = StateGraph(AgentState)
         
-        # Add nodes
-        graph.add_node("start", self.start_conversation)
-        graph.add_node("agent", self.run_agent)
-        graph.add_node("end", self.end_conversation)
+        # Add nodes for each step
+        workflow.add_node("start", self.start_conversation)
+        workflow.add_node("search_knowledge", self.search_knowledge)
+        workflow.add_node("execute_query", self.execute_query)
+        workflow.add_node("learn_from_result", self.learn_from_result)
+        workflow.add_node("generate_answer", self.generate_answer)
         
-        # Add edges
-        graph.add_edge("start", "agent")
-        graph.add_edge("agent", "end")
-        graph.add_edge("end", END)
+        # Define edges with conditions
+        workflow.add_edge("start", "search_knowledge")
+        workflow.add_edge("search_knowledge", "execute_query")
+        workflow.add_edge("execute_query", "learn_from_result")
+        workflow.add_edge("learn_from_result", "generate_answer")
+        workflow.add_edge("learn_from_result", "execute_query", self._should_retry)
+        workflow.add_edge("generate_answer", END)
         
-        # Compile graph with checkpoint manager
-        return graph.compile(checkpointer=get_checkpoint_manager())
+        # Set entry point
+        workflow.set_entry_point("start")
+        
+        # Compile with checkpointing
+        return workflow.compile(checkpointer=get_checkpoint_manager())
 
     async def start_conversation(self, state: AgentState) -> AgentState:
-        """Start a new conversation."""
-        logger.info("Starting conversation")
-        # Initialize state with defaults
-        state.update({
-            "messages": [],
-            "knowledge_results": {},
-            "active_sources": [KnowledgeSource.CONFLUENCE, KnowledgeSource.GRAPHQL, KnowledgeSource.DATABRICKS],
-            "source_errors": {},
-            "schema_context": {},
-            "sql_attempts": [],
-            "graphql_attempts": [],
-            "retry_count": 0,
-            "processing_time": 0.0,
-        })
+        """Initialize conversation with autonomous capabilities."""
+        # Parse user hints for autonomous source selection
+        if state.user_hints:
+            state.execution_context["active_sources"] = state.user_hints.sources
+            state.execution_context["priority"] = state.user_hints.priority
+            state.execution_context["constraints"] = state.user_hints.constraints
+        
+        # Initialize query history
+        state.query_history = QueryHistory()
+        
         return state
 
     def _parse_user_hints(self, message: str) -> UserHint:
@@ -140,21 +150,10 @@ class ChatbotAgent:
             r"#databricks": KnowledgeSource.DATABRICKS,
         }
         
+        # Extract source hints
         for pattern, source in source_patterns.items():
             if re.search(pattern, message.lower()):
-                hints.source = source
-                break
-        
-        # Parse all hashtags as potential categories or tags
-        tag_pattern = r"#(\w+)"
-        all_tags = re.findall(tag_pattern, message.lower())
-        
-        # Filter out source tags
-        source_tags = {tag for tag in source_patterns.keys()}
-        filtered_tags = [tag for tag in all_tags if f"#{tag}" not in source_tags]
-        
-        # Add all remaining tags as categories
-        hints.categories.extend(filtered_tags)
+                hints.sources.append(source)
         
         # Extract metadata from special format: #key:value
         metadata_pattern = r"#(\w+):([^#\s]+)"
@@ -163,522 +162,220 @@ class ChatbotAgent:
         
         return hints
 
-    async def run_agent(self, state: AgentState) -> AgentState:
-        """Run the autonomous agent."""
-        logger.info("Running autonomous agent")
-        start_time = time.time()
-        question = state["human_message_content"]
+    async def search_knowledge(self, state: AgentState) -> AgentState:
+        """Autonomously search knowledge sources based on context."""
+        active_sources = state.execution_context.get("active_sources", [KnowledgeSource.CONFLUENCE])
         
-        try:
-            # Parse user hints
-            state["user_hints"] = self._parse_user_hints(question)
-            
-            # Get conversation history
-            history = await self._get_conversation_history(state["conversation_id"])
-            state["conversation_history"] = history
-            
-            # Create system prompt for autonomous agent
-            system_prompt = """You are an autonomous agent that helps users with their questions about Confluence, GraphQL API, and Databricks.
-You have access to the following tools:
-1. search_confluence: Search Confluence documents
-2. search_graphql_schema: Search GraphQL schema information
-3. search_databricks: Search Databricks schema information
-4. generate_sql: Generate SQL queries
-5. generate_graphql: Generate GraphQL queries
-6. validate_sql: Validate SQL queries
-7. validate_graphql: Validate GraphQL queries
-8. execute_sql: Execute SQL queries
-9. execute_graphql: Execute GraphQL queries
-
-Follow these steps:
-1. First, search for relevant context in all available sources (Confluence, GraphQL, Databricks)
-2. If the question requires SQL or GraphQL, generate and validate queries
-3. Execute queries if needed
-4. Provide a comprehensive answer based on all gathered information
-
-If you need to use multiple tools, do so in a logical sequence.
-If you encounter errors, try alternative approaches.
-Always provide clear explanations of your actions.
-
-For follow-up questions:
-1. Consider the conversation history
-2. Use previous context when relevant
-3. Maintain consistency with previous answers
-4. If the question is ambiguous, ask for clarification
-
-Pay attention to user hints in the question (e.g., #confluence, #faq, #api) to focus your search."""
-
-            # Create messages for the agent
-            messages = [
-                SystemMessage(content=system_prompt),
-                *[HumanMessage(content=msg["content"]) for msg in history],
-                HumanMessage(content=question),
-            ]
-
-            # Run the agent
-            response = await self.llm.ainvoke(messages)
-            
-            # Parse the response to determine actions
-            actions = self._parse_agent_response(response.content, state["user_hints"])
-            
-            # Execute actions in parallel where possible
-            await self._execute_actions_parallel(state, actions)
-
-            # Generate final answer
-            final_answer = await self._generate_final_answer(state)
-            state["final_answer"] = final_answer
-            
-            # Update conversation history
-            state["messages"].append({
-                "role": "user",
-                "content": question,
-            })
-            state["messages"].append({
-                "role": "assistant",
-                "content": final_answer,
-            })
-            
-        except Exception as e:
-            logger.error(f"Error in agent execution: {e}")
-            state["error"] = str(e)
-            state["final_answer"] = "I apologize, but I encountered an error while processing your request. Please try again or rephrase your question."
-        
-        finally:
-            # Update processing time
-            state["processing_time"] = time.time() - start_time
+        for source in active_sources:
+            try:
+                if source == KnowledgeSource.CONFLUENCE:
+                    results = await search_confluence(state.messages[-1]["content"])
+                elif source == KnowledgeSource.GRAPHQL:
+                    results = await search_graphql_schema(state.messages[-1]["content"])
+                elif source == KnowledgeSource.DATABRICKS:
+                    results = await search_databricks(state.messages[-1]["content"])
+                
+                # Create knowledge result with execution plan
+                knowledge_result = KnowledgeResult(
+                    source=source,
+                    content=results[0].content if results else "",
+                    metadata=results[0].metadata if results else {},
+                    relevance_score=results[0].relevance_score if results else 0.0,
+                    execution_plan=self._create_execution_plan(source, results[0] if results else None)
+                )
+                state.knowledge_results.append(knowledge_result)
+                
+            except Exception as e:
+                state.error_state = {"source": source, "error": str(e)}
         
         return state
 
-    async def _execute_actions_parallel(self, state: AgentState, actions: List[Dict[str, Any]]) -> None:
-        """Execute actions in parallel where possible."""
-        # Group actions by type
-        search_actions = [a for a in actions if a["tool"] in ["search_confluence", "search_graphql_schema", "search_databricks"]]
-        query_actions = [a for a in actions if a["tool"] in ["generate_sql", "generate_graphql", "validate_sql", "validate_graphql", "execute_sql", "execute_graphql"]]
-        
-        # Execute search actions in parallel
-        if search_actions:
-            search_tasks = []
-            for action in search_actions:
-                tool_name = action["tool"]
-                state["current_tool"] = tool_name
-                state["tool_input"] = action.get("args", {})
-                
-                # Add user hints to search context
-                if state["user_hints"]:
-                    state["tool_input"]["hints"] = state["user_hints"]
-                
-                tool = next((t for t in self.tools if t["name"] == tool_name), None)
-                if tool:
-                    search_tasks.append(self._execute_tool_safely(tool, state))
+    async def execute_query(self, state: AgentState) -> AgentState:
+        """Autonomously execute queries with learning capabilities."""
+        for result in state.knowledge_results:
+            if not result.query_history:
+                result.query_history = QueryHistory()
             
-            # Wait for all search tasks to complete
-            search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+            # Generate query based on source
+            query = await self._generate_query(result)
             
-            # Process search results
-            for tool_name, result in zip([a["tool"] for a in search_actions], search_results):
-                if isinstance(result, Exception):
-                    state["source_errors"][tool_name] = str(result)
-                else:
-                    source = self._get_source_from_tool(tool_name)
-                    state["knowledge_results"][source] = [
-                        SearchResult(
-                            source=source,
-                            content=item,
-                            relevance_score=self._calculate_relevance(item, state["human_message_content"]),
-                            category=self._determine_category(item, state["user_hints"]),
-                        )
-                        for item in result
-                    ]
-                    
-                    # Update schema context if available
-                    if source in [KnowledgeSource.GRAPHQL, KnowledgeSource.DATABRICKS]:
-                        state["schema_context"][source] = self._extract_schema_context(result)
-        
-        # Execute query actions sequentially
-        for action in query_actions:
-            tool_name = action["tool"]
-            state["current_tool"] = tool_name
-            state["tool_input"] = action.get("args", {})
-            
-            # Add schema context to query generation
-            if tool_name in ["generate_sql", "generate_graphql"]:
-                state["tool_input"]["schema_context"] = state["schema_context"]
+            # Create new attempt
+            attempt = QueryAttempt(
+                query=query,
+                status=QueryStatus.EXECUTING,
+                timestamp=datetime.utcnow()
+            )
+            result.query_history.attempts.append(attempt)
+            result.query_history.total_attempts += 1
             
             try:
-                tool = next((t for t in self.tools if t["name"] == tool_name), None)
-                if tool:
-                    result = await tool["function"](**state["tool_input"])
-                    state["tool_output"] = result
-                    
-                    if tool_name == "generate_sql":
-                        state["sql_query"] = result.generated_query
-                        state["sql_attempts"].append({
-                            "query": result.generated_query,
-                            "thought": result.thought,
-                            "description": result.description,
-                            "schema_context": result.schema_context,
-                        })
-                    elif tool_name == "generate_graphql":
-                        state["graphql_query"] = result.generated_query
-                        state["graphql_attempts"].append({
-                            "query": result.generated_query,
-                            "thought": result.thought,
-                            "description": result.description,
-                            "schema_context": result.schema_context,
-                        })
-                    elif tool_name == "validate_sql":
-                        state["sql_validation"] = result
-                        if not result.is_valid:
-                            new_sql = await self._retry_sql_generation(state)
-                            if new_sql:
-                                state["sql_query"] = new_sql.generated_query
-                                state["sql_attempts"].append({
-                                    "query": new_sql.generated_query,
-                                    "thought": new_sql.thought,
-                                    "description": new_sql.description,
-                                    "schema_context": new_sql.schema_context,
-                                })
-                    elif tool_name == "validate_graphql":
-                        state["graphql_validation"] = result
-                        if not result.is_valid:
-                            new_graphql = await self._retry_graphql_generation(state)
-                            if new_graphql:
-                                state["graphql_query"] = new_graphql.generated_query
-                                state["graphql_attempts"].append({
-                                    "query": new_graphql.generated_query,
-                                    "thought": new_graphql.thought,
-                                    "description": new_graphql.description,
-                                    "schema_context": new_graphql.schema_context,
-                                })
-                    elif tool_name == "execute_sql":
-                        state["sql_result"] = result
-                    elif tool_name == "execute_graphql":
-                        state["graphql_result"] = result
-            except Exception as e:
-                logger.error(f"Error executing tool {tool_name}: {e}")
-                state["tool_error"] = str(e)
-                state["retry_count"] += 1
+                # Execute query
+                start_time = time.time()
+                query_result = await self._execute_query(result.source, query)
+                execution_time = time.time() - start_time
                 
-                if state["retry_count"] > 3:
-                    raise Exception(f"Max retries exceeded for tool {tool_name}")
+                # Update attempt
+                attempt.status = QueryStatus.SUCCESS
+                attempt.result = query_result
+                attempt.execution_time = execution_time
+                
+                # Update best result
+                if not result.query_history.best_result or execution_time < result.query_history.attempts[0].execution_time:
+                    result.query_history.best_result = query_result
+                
+            except Exception as e:
+                attempt.status = QueryStatus.ERROR
+                attempt.error = str(e)
+                state.error_state = {"source": result.source, "error": str(e)}
+        
+        return state
 
-    def _determine_category(self, content: Dict[str, Any], hints: Optional[UserHint]) -> Optional[str]:
-        """Determine the category of search result based on content and hints."""
-        if not hints:
-            return None
+    async def learn_from_result(self, state: AgentState) -> AgentState:
+        """Learn from query execution results and improve future attempts."""
+        for result in state.knowledge_results:
+            if result.query_history and result.query_history.attempts:
+                latest_attempt = result.query_history.attempts[-1]
+                
+                if latest_attempt.status == QueryStatus.ERROR:
+                    # Learn from error
+                    improvement = await self._learn_from_error(
+                        result.source,
+                        latest_attempt.query,
+                        latest_attempt.error
+                    )
+                    if improvement:
+                        result.query_history.learned_improvements.append(improvement)
+                
+                elif latest_attempt.status == QueryStatus.SUCCESS:
+                    # Learn from success
+                    improvement = await self._learn_from_success(
+                        result.source,
+                        latest_attempt.query,
+                        latest_attempt.result
+                    )
+                    if improvement:
+                        result.query_history.learned_improvements.append(improvement)
+        
+        return state
+
+    def _should_retry(self, state: AgentState) -> bool:
+        """Determine if query should be retried based on learning."""
+        if state.retry_count >= state.max_retries:
+            return False
             
-        # Check content metadata for category
-        if "category" in content:
-            return content["category"]
+        for result in state.knowledge_results:
+            if result.query_history and result.query_history.attempts:
+                latest_attempt = result.query_history.attempts[-1]
+                if latest_attempt.status == QueryStatus.ERROR:
+                    return True
         
-        # Check hints for category
-        if hints.categories:
-            return hints.categories[0]
-        
+        return False
+
+    async def _generate_query(self, result: KnowledgeResult) -> str:
+        """Generate query based on source and context."""
+        if result.source == KnowledgeSource.GRAPHQL:
+            return await self._generate_graphql_query(result)
+        elif result.source == KnowledgeSource.DATABRICKS:
+            return await self._generate_sql_query(result)
+        return ""
+
+    async def _execute_query(self, source: KnowledgeSource, query: str) -> Any:
+        """Execute query based on source."""
+        if source == KnowledgeSource.GRAPHQL:
+            return await self._execute_graphql_query(query)
+        elif source == KnowledgeSource.DATABRICKS:
+            return await self._execute_sql_query(query)
         return None
 
-    def _extract_schema_context(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Extract schema context from search results."""
-        schema_context = {}
-        for result in results:
-            if "schema" in result:
-                schema_context.update(result["schema"])
-        return schema_context
-
-    async def search_confluence(self, query: str, hints: Optional[UserHint] = None) -> List[Dict[str, Any]]:
-        """Search Confluence documents."""
-        logger.info(f"Searching Confluence: {query}")
-        # Add category filter if specified in hints
-        if hints and hints.categories:
-            category_filters = [f"category:{cat}" for cat in hints.categories]
-            query = f"{query} {' '.join(category_filters)}"
-            
-        # Add metadata filters if specified
-        if hints and hints.metadata:
-            metadata_filters = [f"{key}:{value}" for key, value in hints.metadata.items()]
-            query = f"{query} {' '.join(metadata_filters)}"
-            
-        return await self.confluence_retriever.ainvoke(query)
-
-    async def search_graphql_schema(self, query: str, hints: Optional[UserHint] = None) -> List[Dict[str, Any]]:
-        """Search GraphQL schema information."""
-        logger.info(f"Searching GraphQL schema: {query}")
-        # Add metadata filters if specified
-        if hints and hints.metadata:
-            metadata_filters = [f"{key}:{value}" for key, value in hints.metadata.items()]
-            query = f"{query} {' '.join(metadata_filters)}"
-        
-        # Search for schema information
-        results = await self.graphql_schema_retriever.ainvoke(query)
-        
-        # Process and structure schema information
-        processed_results = []
-        for result in results:
-            if "schema" in result:
-                # Extract type definitions, fields, and relationships
-                schema_info = {
-                    "type": result.get("type", ""),
-                    "fields": result.get("fields", []),
-                    "relationships": result.get("relationships", []),
-                    "description": result.get("description", ""),
-                    "metadata": result.get("metadata", {}),
-                }
-                processed_results.append({
-                    "content": schema_info,
-                    "schema": result["schema"],  # Keep full schema for validation
-                })
-        
-        return processed_results
-
-    async def search_databricks(self, query: str, hints: Optional[UserHint] = None) -> List[Dict[str, Any]]:
-        """Search Databricks schema."""
-        logger.info(f"Searching Databricks: {query}")
-        # Add metadata filters if specified
-        if hints and hints.metadata:
-            metadata_filters = [f"{key}:{value}" for key, value in hints.metadata.items()]
-            query = f"{query} {' '.join(metadata_filters)}"
-        
-        # Search for table metadata
-        results = await self.databricks_retriever.ainvoke(query)
-        
-        # Process and structure table metadata
-        processed_results = []
-        for result in results:
-            if "table_metadata" in result:
-                # Extract table structure, columns, and constraints
-                table_info = {
-                    "table_name": result.get("table_name", ""),
-                    "columns": result.get("columns", []),
-                    "constraints": result.get("constraints", []),
-                    "description": result.get("description", ""),
-                    "metadata": result.get("metadata", {}),
-                }
-                processed_results.append({
-                    "content": table_info,
-                    "schema": result["table_metadata"],  # Keep full metadata for validation
-                })
-        
-        return processed_results
-
-    async def generate_sql(
-        self,
-        question: str,
-        context: List[Dict[str, Any]] = None,
-        schema_context: Optional[Dict[str, Any]] = None,
-        retry_prompt: str = None,
-    ) -> SQLGenerationOutput:
-        """Generate SQL query."""
-        logger.info("Generating SQL query")
-        
-        # Extract table metadata from context
-        table_info = {}
-        if context:
-            for item in context:
-                if "schema" in item:
-                    table_info.update(item["schema"])
-        
-        # Create SQL generation prompt with table metadata
+    async def _learn_from_error(self, source: KnowledgeSource, query: str, error: str) -> Optional[str]:
+        """Learn from query execution error."""
         prompt = ChatPromptTemplate.from_messages([
-            ("system", """Generate a SQL query based on the question, context, and table metadata.
-Follow these rules:
-1. Use only tables and columns defined in the metadata
-2. Respect table relationships and constraints
-3. Include appropriate JOIN conditions
-4. Add necessary WHERE clauses for filtering
-5. Use proper aggregation functions
-6. Follow SQL best practices and security guidelines"""),
-            ("human", f"""Question: {question}
-Context: {context or []}
-Table Metadata: {table_info or {}}
-{retry_prompt or ''}"""),
+            ("system", "You are an expert at analyzing query errors and suggesting improvements."),
+            ("human", f"Query: {query}\nError: {error}\nSource: {source}\nWhat specific improvement can be made to fix this error?")
         ])
         
-        # Generate SQL
         chain = prompt | self.llm | StrOutputParser()
-        response = await chain.ainvoke({})
-        
-        return SQLGenerationOutput(
-            thought="Generated SQL query with table metadata validation",
-            description="SQL query following table constraints",
-            generated_query=response,
-            schema_context=table_info,
-        )
+        return await chain.ainvoke({})
 
-    async def generate_graphql(
-        self,
-        question: str,
-        context: List[Dict[str, Any]] = None,
-        schema_context: Optional[Dict[str, Any]] = None,
-        retry_prompt: str = None,
-    ) -> GraphQLGenerationOutput:
-        """Generate GraphQL query."""
-        logger.info("Generating GraphQL query")
-        
-        # Extract schema information from context
-        schema_info = {}
-        if context:
-            for item in context:
-                if "schema" in item:
-                    schema_info.update(item["schema"])
-        
-        # Create GraphQL generation prompt with schema context
+    async def _learn_from_success(self, source: KnowledgeSource, query: str, result: Any) -> Optional[str]:
+        """Learn from successful query execution."""
         prompt = ChatPromptTemplate.from_messages([
-            ("system", """Generate a GraphQL query based on the question, context, and schema information.
-Follow these rules:
-1. Use only fields and types defined in the schema
-2. Respect relationships between types
-3. Include necessary fragments for complex queries
-4. Add appropriate variables for dynamic values
-5. Include error handling fields
-6. Follow GraphQL best practices"""),
-            ("human", f"""Question: {question}
-Context: {context or []}
-Schema Context: {schema_info or {}}
-{retry_prompt or ''}"""),
+            ("system", "You are an expert at analyzing successful queries and suggesting optimizations."),
+            ("human", f"Query: {query}\nResult: {result}\nSource: {source}\nWhat specific optimization can be made to improve this query?")
         ])
         
-        # Generate GraphQL
         chain = prompt | self.llm | StrOutputParser()
-        response = await chain.ainvoke({})
-        
-        return GraphQLGenerationOutput(
-            thought="Generated GraphQL query with schema validation",
-            description="GraphQL query following schema constraints",
-            generated_query=response,
-            schema_context=schema_info,
-        )
+        return await chain.ainvoke({})
 
-    async def validate_sql(self, sql: str, question: str, schema_context: Optional[Dict[str, Any]] = None) -> ValidationOutput:
-        """Validate SQL query."""
-        logger.info("Validating SQL query")
-        
-        # Create validation prompt with table metadata
+    def _create_execution_plan(self, source: KnowledgeSource, result: Optional[SearchResult]) -> Dict[str, Any]:
+        """Create execution plan for query."""
+        return {
+            "source": source,
+            "context": result.metadata if result else {},
+            "strategy": "autonomous" if source in [KnowledgeSource.GRAPHQL, KnowledgeSource.DATABRICKS] else "search",
+            "priority": 1
+        }
+
+    async def _generate_graphql_query(self, result: KnowledgeResult) -> str:
+        """Generate GraphQL query with learning from previous attempts."""
         prompt = ChatPromptTemplate.from_messages([
-            ("system", """Validate the SQL query against the table metadata.
-Check for:
-1. Valid tables and columns
-2. Proper JOIN conditions
-3. WHERE clause syntax
-4. Aggregation functions
-5. Subquery structure
-6. Query performance"""),
-            ("human", f"""Question: {question}
-SQL: {sql}
-Table Metadata: {schema_context or {}}"""),
+            ("system", "You are an expert at generating GraphQL queries."),
+            ("human", f"Schema: {result.content}\nContext: {result.metadata}\nPrevious attempts: {result.query_history.attempts if result.query_history else []}\nGenerate a GraphQL query.")
         ])
         
-        # Validate SQL
         chain = prompt | self.llm | StrOutputParser()
-        response = await chain.ainvoke({})
-        
-        return ValidationOutput(
-            is_valid="valid" in response.lower(),
-            explanation=response,
-            schema_validation=schema_context,
-        )
+        return await chain.ainvoke({})
 
-    async def validate_graphql(self, query: str, question: str, schema_context: Optional[Dict[str, Any]] = None) -> ValidationOutput:
-        """Validate GraphQL query."""
-        logger.info("Validating GraphQL query")
-        
-        # Create validation prompt with schema context
+    async def _generate_sql_query(self, result: KnowledgeResult) -> str:
+        """Generate SQL query with learning from previous attempts."""
         prompt = ChatPromptTemplate.from_messages([
-            ("system", """Validate the GraphQL query against the schema.
-Check for:
-1. Valid types and fields
-2. Proper relationships
-3. Required arguments
-4. Variable definitions
-5. Fragment usage
-6. Query complexity"""),
-            ("human", f"""Question: {question}
-GraphQL: {query}
-Schema Context: {schema_context or {}}"""),
+            ("system", "You are an expert at generating SQL queries."),
+            ("human", f"Schema: {result.content}\nContext: {result.metadata}\nPrevious attempts: {result.query_history.attempts if result.query_history else []}\nGenerate a SQL query.")
         ])
         
-        # Validate GraphQL
         chain = prompt | self.llm | StrOutputParser()
-        response = await chain.ainvoke({})
-        
-        return ValidationOutput(
-            is_valid="valid" in response.lower(),
-            explanation=response,
-            schema_validation=schema_context,
-        )
+        return await chain.ainvoke({})
 
-    async def execute_sql(self, sql: str) -> str:
-        """Execute SQL query."""
-        logger.info("Executing SQL query")
-        # Implement SQL execution logic
-        return "SQL execution result"
-
-    async def execute_graphql(self, query: str) -> str:
+    async def _execute_graphql_query(self, query: str) -> Any:
         """Execute GraphQL query."""
-        logger.info("Executing GraphQL query")
-        # Implement GraphQL execution logic
-        return "GraphQL execution result"
+        # Implement GraphQL query execution
+        pass
 
-    async def _retry_sql_generation(self, state: AgentState) -> Optional[SQLGenerationOutput]:
-        """Retry SQL generation with improved context."""
-        logger.info("Retrying SQL generation")
-        
-        # Create retry prompt with previous attempts
-        retry_prompt = f"""Previous SQL attempts:
-{chr(10).join(f'- {attempt["query"]} (Reason: {attempt["description"]})' for attempt in state["sql_attempts"])}
+    async def _execute_sql_query(self, query: str) -> Any:
+        """Execute SQL query."""
+        # Implement SQL query execution
+        pass
 
-Please generate a new SQL query that addresses the issues with previous attempts.
-Consider the validation feedback: {state["sql_validation"].explanation}"""
-        
-        # Generate new SQL
-        return await self.generate_sql(
-            question=state["human_message_content"],
-            context=state["knowledge_results"].get(KnowledgeSource.DATABRICKS, []),
-            schema_context=state["schema_context"].get(KnowledgeSource.DATABRICKS),
-            retry_prompt=retry_prompt,
-        )
-
-    async def _retry_graphql_generation(self, state: AgentState) -> Optional[GraphQLGenerationOutput]:
-        """Retry GraphQL generation with improved context."""
-        logger.info("Retrying GraphQL generation")
-        
-        # Create retry prompt with previous attempts
-        retry_prompt = f"""Previous GraphQL attempts:
-{chr(10).join(f'- {attempt["query"]} (Reason: {attempt["description"]})' for attempt in state["graphql_attempts"])}
-
-Please generate a new GraphQL query that addresses the issues with previous attempts.
-Consider the validation feedback: {state["graphql_validation"].explanation}"""
-        
-        # Generate new GraphQL
-        return await self.generate_graphql(
-            question=state["human_message_content"],
-            context=state["knowledge_results"].get(KnowledgeSource.GRAPHQL, []),
-            schema_context=state["schema_context"].get(KnowledgeSource.GRAPHQL),
-            retry_prompt=retry_prompt,
-        )
-
-    async def _generate_final_answer(self, state: AgentState) -> str:
-        """Generate final answer based on state."""
-        # Create answer generation prompt
+    async def generate_answer(self, state: AgentState) -> AgentState:
+        """Generate final answer with execution summary."""
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "Generate a comprehensive answer based on the gathered information."),
-            ("human", f"""Question: {state['human_message_content']}
-Conversation History: {state.get('conversation_history', [])}
-Knowledge Results:
-{self._format_knowledge_results(state['knowledge_results'])}
-SQL Query: {state.get('sql_query')}
-SQL Result: {state.get('sql_result')}
-GraphQL Query: {state.get('graphql_query')}
-GraphQL Result: {state.get('graphql_result')}
-Previous SQL Attempts: {state.get('sql_attempts', [])}
-Previous GraphQL Attempts: {state.get('graphql_attempts', [])}
-User Hints: {state.get('user_hints')}"""),
+            ("system", "You are an expert at generating comprehensive answers."),
+            ("human", f"Context: {state.knowledge_results}\nQuery history: {state.query_history}\nGenerate a detailed answer.")
         ])
         
-        # Generate answer
         chain = prompt | self.llm | StrOutputParser()
-        response = await chain.ainvoke({})
+        answer = await chain.ainvoke({})
         
-        return response
+        state.final_answer = FinalAnswerOutput(
+            answer=answer,
+            sources=[SearchResult(
+                content=r.content,
+                source=r.source,
+                metadata=r.metadata,
+                relevance_score=r.relevance_score,
+                query_history=r.query_history
+            ) for r in state.knowledge_results],
+            confidence=0.9,  # Calculate based on results
+            reasoning="Generated from multiple knowledge sources with autonomous execution",
+            query_history=state.query_history,
+            execution_summary={
+                "total_queries": sum(r.query_history.total_attempts for r in state.knowledge_results if r.query_history),
+                "successful_queries": sum(1 for r in state.knowledge_results if r.query_history and r.query_history.attempts and r.query_history.attempts[-1].status == QueryStatus.SUCCESS),
+                "learned_improvements": [imp for r in state.knowledge_results if r.query_history for imp in r.query_history.learned_improvements]
+            }
+        )
+        
+        return state
 
     def _format_knowledge_results(self, results: Dict[KnowledgeSource, List[SearchResult]]) -> str:
         """Format knowledge results for prompt."""
@@ -686,8 +383,7 @@ User Hints: {state.get('user_hints')}"""),
         for source, items in results.items():
             formatted.append(f"{source.value.upper()}:")
             for item in items:
-                category_str = f" [{item.category}]" if item.category else ""
-                formatted.append(f"- {item.content} (Relevance: {item.relevance_score}){category_str}")
+                formatted.append(f"- {item.content} (Relevance: {item.relevance_score})")
         return "\n".join(formatted)
 
     async def end_conversation(self, state: AgentState) -> AgentState:

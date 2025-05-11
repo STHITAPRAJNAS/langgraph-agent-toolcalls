@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional, TypedDict, Union
 from enum import Enum
 from pydantic import BaseModel, Field
+from datetime import datetime
 
 
 class KnowledgeSource(str, Enum):
@@ -10,31 +11,56 @@ class KnowledgeSource(str, Enum):
     DATABRICKS = "databricks"
 
 
-class KnowledgeCategory(str, Enum):
-    """Enum for different knowledge categories."""
-    FAQ = "faq"
-    API = "api"
-    SCHEMA = "schema"
-    METADATA = "metadata"
-    DOCUMENTATION = "documentation"
-    BEST_PRACTICES = "best_practices"
+class QueryStatus(str, Enum):
+    PENDING = "pending"
+    EXECUTING = "executing"
+    SUCCESS = "success"
+    ERROR = "error"
+    RETRYING = "retrying"
+    FAILED = "failed"
+
+
+class QueryAttempt(BaseModel):
+    query: str
+    status: QueryStatus
+    error: Optional[str] = None
+    result: Optional[Any] = None
+    execution_time: Optional[float] = None
+    feedback: Optional[str] = None
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+
+class QueryHistory(BaseModel):
+    attempts: List[QueryAttempt] = Field(default_factory=list)
+    total_attempts: int = 0
+    best_result: Optional[Any] = None
+    learned_improvements: List[str] = Field(default_factory=list)
+
+
+class KnowledgeResult(BaseModel):
+    source: KnowledgeSource
+    content: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    relevance_score: float
+    query_history: Optional[QueryHistory] = None
+    execution_plan: Optional[Dict[str, Any]] = None
 
 
 class UserHint(BaseModel):
     """Model for user hints in questions."""
-    source: Optional[KnowledgeSource] = None
-    categories: List[str] = Field(default_factory=list)  # Generic categories
-    tags: List[str] = Field(default_factory=list)
-    metadata: Dict[str, Any] = Field(default_factory=dict)  # Additional metadata for hints
+    sources: List[KnowledgeSource] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    priority: Optional[int] = None
+    constraints: Optional[Dict[str, Any]] = None
 
 
 class SearchResult(BaseModel):
     """Model for search results from any source."""
+    content: str
     source: KnowledgeSource
-    content: Dict[str, Any]
-    relevance_score: float = Field(ge=0.0, le=1.0)
     metadata: Dict[str, Any] = Field(default_factory=dict)
-    category: Optional[str] = None  # Generic category
+    relevance_score: float
+    query_history: Optional[QueryHistory] = None
 
 
 class SQLGenerationOutput(BaseModel):
@@ -63,55 +89,40 @@ class ValidationOutput(BaseModel):
 class FinalAnswerOutput(BaseModel):
     """Final answer output."""
     answer: str
-    sources: List[SearchResult] = Field(default_factory=list)
-    confidence: float = Field(ge=0.0, le=1.0, default=1.0)
-    knowledge_sources: List[KnowledgeSource] = Field(default_factory=list)
-    used_hints: Optional[UserHint] = None
+    sources: List[SearchResult]
+    confidence: float
+    reasoning: str
+    query_history: Optional[QueryHistory] = None
+    execution_summary: Optional[Dict[str, Any]] = None
 
 
-class AgentState(TypedDict, total=False):
-    """State for the agent."""
-    # Core state
-    conversation_id: str
-    human_message_content: str
-    messages: List[Dict[str, Any]]
-    user_hints: Optional[UserHint]
-    
-    # Tool execution state
-    current_tool: Optional[str]
-    tool_input: Optional[Dict[str, Any]]
-    tool_output: Optional[Any]
-    tool_error: Optional[str]
-    
-    # Knowledge state
-    knowledge_results: Dict[KnowledgeSource, List[SearchResult]]
-    active_sources: List[KnowledgeSource]
-    source_errors: Dict[KnowledgeSource, str]
-    schema_context: Dict[KnowledgeSource, Dict[str, Any]]
-    
-    # Query state
-    sql_query: Optional[str]
-    sql_validation: Optional[ValidationOutput]
-    sql_result: Optional[Any]
-    sql_attempts: List[Dict[str, Any]]
-    
-    graphql_query: Optional[str]
-    graphql_validation: Optional[ValidationOutput]
-    graphql_result: Optional[Any]
-    graphql_attempts: List[Dict[str, Any]]
-    
-    # Final state
-    final_answer: Optional[str]
-    error: Optional[str]
-    retry_count: int
-    processing_time: float
+class AgentState(BaseModel):
+    messages: List[Dict[str, str]] = Field(default_factory=list)
+    knowledge_results: List[KnowledgeResult] = Field(default_factory=list)
+    current_query: Optional[str] = None
+    query_history: Optional[QueryHistory] = None
+    user_hints: Optional[UserHint] = None
+    execution_context: Dict[str, Any] = Field(default_factory=dict)
+    learning_state: Dict[str, Any] = Field(default_factory=dict)
+    error_state: Optional[Dict[str, Any]] = None
+    retry_count: int = 0
+    max_retries: int = 3
+    conversation_id: Optional[str] = None
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+
+class ChatInput(BaseModel):
+    message: str
+    conversation_id: Optional[str] = None
+    user_hints: Optional[UserHint] = None
+    execution_context: Optional[Dict[str, Any]] = None
 
 
 class ChatResponse(BaseModel):
     """Response model for chat endpoints."""
+    response: str
     conversation_id: str
-    message: str
-    conversation_name: Optional[str] = None
-    sources: List[SearchResult] = Field(default_factory=list)
-    processing_time: float
-    used_hints: Optional[UserHint] = None 
+    sources: List[SearchResult]
+    confidence: float
+    query_history: Optional[QueryHistory] = None
+    execution_summary: Optional[Dict[str, Any]] = None 
